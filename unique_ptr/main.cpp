@@ -1,3 +1,5 @@
+// this is to solve the problem of manually deleting a pointer from a caller
+
 // class template
 // a class-shaped blueprint that isn't a real class until you say which type it is for
 template<class T>
