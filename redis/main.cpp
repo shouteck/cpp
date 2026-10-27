@@ -8,31 +8,10 @@
 #include <chrono>
 #include <optional>
 #include <condition_variable>
-#include <queue>
 
 #include "lock_guard.h"
 
 using Clock = std::chrono::steady_clock;
-
-struct TaskQueue {
-	std::queue<SOCKET> tasks;
-	std::mutex m;
-	std::condition_variable cv;
-	void push(SOCKET s) {
-		{
-			LockGuard lg(m); tasks.push(s);
-		}
-		cv.notify_one();
-	}
-	SOCKET take() {
-		std::unique_lock<std::mutex> lk(m);
-		cv.wait(lk, [&] { 
-			return !tasks.empty();
-		});
-		SOCKET s = tasks.front(); tasks.pop();
-		return s;
-	}
-};
 
 struct Entry {
 	std::string value;
@@ -92,20 +71,12 @@ std::string handle(Db& db, const std::string& line) {
 
 }
 
-void serve(SOCKET client, Db& db) {
+void serve_http(SOCKET client, Db& db, const std::string& request) {
 
-	std::string acc;
-	// char buf[512];
-	char buf[4096];
-
-	int n = recv(client, buf, sizeof(buf), 0);
-	
-	if (n <= 0) {
-		closesocket(client); return;
-	}
-
-	std::string request(buf, n);
-	std::cout << request << std::endl;
+	// most threads spend most life blocked inside recv - sleeping
+	// but here's the thing, the OS already knows which sockets have bytes ready
+	// instead of N threads each asking "anything for me" repeatedly
+	// one thread asks the OS "which of all my sockets are ready right now"
 
 	std::istringstream iss(request);
 	std::string method, path, version;
@@ -136,41 +107,6 @@ void serve(SOCKET client, Db& db) {
         "\r\n" + body;
  
     send(client, resp.data(), (int)resp.size(), 0);	
-
-	/*
-
-	while (true) {
-		// kernel keeps a per-socket mailbox
-		// bytes arriving from the client pile up in a queue inside the OS
-		// recv drains it
-		// give me whatever sitting there up to sizeof(buf) bytes
-		int n = recv(client, buf, sizeof(buf), 0);
-		// n == 0 - client hung up
-		// n < 0 - SOCKET_ERROR
-		if (n <= 0) break;
-		acc.append(buf, n);
-		
-		bool hangup = false;
-		while (true) {
-			size_t pos = acc.find('\n');
-			if (pos == std::string::npos) break;
-			std::string line = acc.substr(0, pos);
-			acc.erase(0, pos + 1);
-			std::string reply = handle(db, line);
-			reply += '\n';
-			// kernel outbound queue
-			send(client, reply.data(), (int)reply.size(), 0);
-			if (reply == "bye\n") {
-				hangup = true; break;
-			}			
-		}
-
-		if (hangup) break;
-
-	}
-	*/
-
-	closesocket(client);
 
 }
 
@@ -204,11 +140,79 @@ void sweeper(Db& db) {
 
 }
 
-void worker(Db& db, TaskQueue& tasks) {
-	while (true) {
-		SOCKET client = tasks.take();
-		serve(client, db);
-	}
+void worker(SOCKET listenSock, Db& db) {
+
+	// previously, the queue's job was dealing clients to workers
+	// in this model, accept moved inside the workers
+	// every worker select watches the shared listener directly
+
+    std::unordered_map<SOCKET, std::string> sessions;
+    u_long mode = 1; char buf[512];
+
+    while (true) {
+
+    	// set of sockets to watch
+        fd_set readfds;
+        // clear sockets
+        // if you skipped FD_ZERO, dead sockets may linger
+        FD_ZERO(&readfds);
+        // add listenSock to the watch list
+        FD_SET(listenSock, &readfds);
+        // add this worker's own clients to the watch list
+        for (auto& [s, acc] : sessions) FD_SET(s, &readfds);
+
+        // sleep till anyone's ready
+        select(0, &readfds, NULL, NULL, NULL);
+
+        // listener ready, a knock pending
+        if (FD_ISSET(listenSock, &readfds)) {
+            SOCKET c = accept(listenSock, NULL, NULL);
+            if (c != INVALID_SOCKET) {
+                ioctlsocket(c, FIONBIO, &mode);
+                sessions[c] = "";
+            }
+        }
+
+        // walk into MY section — service whoever's ready
+        for (auto it = sessions.begin(); it != sessions.end(); ) {
+            SOCKET s = it->first;
+            std::string& acc = it->second;
+
+            if (!FD_ISSET(s, &readfds)) { ++it; continue; }
+
+            int n = recv(s, buf, sizeof(buf), 0);
+            // hangup → close + remove
+            if (n <= 0) {
+                closesocket(s);
+                it = sessions.erase(it);
+                continue;
+            }
+
+            acc.append(buf, n);
+
+            // a complete request = headers ending \r\n\r\n + Content-Length body bytes
+            // consume one request's worth, keep the tail — keep-alive:
+            // the connection persists, the next request may already be in acc
+            while (true) {
+                size_t hdr_end = acc.find("\r\n\r\n");
+                if (hdr_end == std::string::npos) break;   // headers incomplete
+
+                // body length declared by Content-Length header (0 when absent)
+                size_t body_len = 0;
+                size_t cl_pos = acc.find("Content-Length: ");
+                if (cl_pos != std::string::npos && cl_pos < hdr_end)
+                    body_len = (size_t)std::stoul(acc.substr(cl_pos + 16));
+
+                size_t req_len = hdr_end + 4 + body_len;
+                if (acc.size() < req_len) break;           // body incomplete
+
+                std::string request = acc.substr(0, req_len);
+                acc.erase(0, req_len);                     // keep the tail
+                serve_http(s, db, request);
+            }
+            ++it;
+        }
+    }
 }
 
 int main() {
@@ -230,6 +234,8 @@ int main() {
 	// SOCK_STREAM - what conversation style? (TCP/UDP)
 	// 0 - default
 	SOCKET listenSock = socket(AF_INET, SOCK_STREAM, 0);
+	u_long mode = 1;
+	ioctlsocket(listenSock, FIONBIO, &mode);
 	if (listenSock == INVALID_SOCKET) {
 		std::cout << "socket failed: " << WSAGetLastError() << std::endl;
 		WSACleanup(); return 1;
@@ -268,30 +274,10 @@ int main() {
 
 	std::thread(sweeper, std::ref(db)).detach();
 
-	TaskQueue tasks;
-	for (int i = 0; i < 4; i++) 
-		std::thread(worker, std::ref(db), std::ref(tasks)).detach();
-
-	while (true) {
-		// answering the call
-		// it is a blocking wait
-		SOCKET client = accept(listenSock, NULL, NULL);
-		if (client == INVALID_SOCKET) {
-			std::cout << "accept failed: " << WSAGetLastError() << std::endl;
-			continue;			
-		}
-		// std::ref is required because of std::thread
-		// server parameter is unordered_map&
-		// but std::thread doesn't call serve directly
-		// it copies its arguments into internal storage first
-		// then invokes serve with those stored copies	
-
-		// detach() - allows main to continue working
-		// std::thread(serve, client, std::ref(db)).detach();
-
-		tasks.push(client);
-
-	}
+	// N workers each run their own select loop — shared listener, racing accepts
+	for (int i = 0; i < 4; i++)
+		std::thread(worker, listenSock, std::ref(db)).detach();
+	worker(listenSock, db);   // main is worker #0 — don't waste the thread
 
 	closesocket(listenSock);
 	WSACleanup();
